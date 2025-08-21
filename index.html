@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Dreamy Falling Squares - Vanilla JS</title>
+<style>
+  html, body { height:100%; margin:0; background:#05060a; overflow:hidden; }
+  canvas { display:block; width:100vw; height:100vh; }
+  .hint {
+    position: fixed; left: 12px; bottom: 10px; padding: 6px 10px;
+    font: 12px/1.2 system-ui, sans-serif; color: #e7edf6;
+    background: rgba(0,0,0,.35); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 10px; backdrop-filter: blur(6px); pointer-events:none;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div class="hint">クリック/スペース: 一時停止・再開　M: マウス引力ON/OFF</div>
+<script>
+(() => {
+  'use strict';
+
+  /** ===== 調整パラメータ ===== */
+  const NUM_SQUARES    = 32;     // 正方形の個数
+  const NUM_BOKEH      = 24;     // 背景のボケ粒
+  const SIZE_MIN       = 22;
+  const SIZE_MAX       = 150;
+  const FALL_MIN       = 40;     // 落下速度 px/s
+  const FALL_MAX       = 220;
+  const ROT_MIN        = -2.2;   // 回転速度 rad/s
+  const ROT_MAX        =  2.2;
+  const SWAY_AMP_MIN   = 14;     // 横揺れ振幅
+  const SWAY_AMP_MAX   = 140;
+  const SWAY_FREQ_MIN  = 0.18;   // 横揺れ周波数
+  const SWAY_FREQ_MAX  = 1.6;
+  const LIFE_MIN       = 6.0;    // 寿命（秒）…フェードイン/アウトに使用
+  const LIFE_MAX       = 14.0;
+  const HUE_DRIFT      = 12;     // 1秒あたりの色相ドリフト（度）
+  const TRAIL          = 0.33;   // 残像。0〜0.2程度が良い
+  const ADDITIVE_GLOW  = true;   // trueで加算合成（重なりが発光）
+  const BG_HUE_SPEED   = 2;      // 背景グラデの色相回転 2deg/s
+  const PARALLAX       = 0.15;   // マウスで背景をわずかに視差移動
+  const USE_MOUSE_GRAV = true;   // 初期値：マウス引力ON
+  const MOUSE_GRAVITY  = 12.0;   // 引力の強さ
+  const DOF_BLUR_MAX   = 5.5;    // 被写界深度の最大ぼかし(px)
+  const STAR_TWINKLE   = true;   // 星屑の瞬き
+
+  /** ===== 基本セットアップ ===== */
+  const canvas = document.getElementById('screen');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  let paused = false;
+  let mouseAttract = USE_MOUSE_GRAV;
+  let mouse = { x: innerWidth/2, y: innerHeight/2 };
+
+  // 追加: 露出(最終合成の透明度)
+  const EXPOSURE = 0.7; // 0.6〜0.85くらいで好み調整
+
+  // 追加: 残像バッファ
+  const trailCanvas = document.createElement('canvas');
+  const trailCtx = trailCanvas.getContext('2d', { alpha: false });
+
+  function fitToScreen() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const w = Math.floor(window.innerWidth);
+    const h = Math.floor(window.innerHeight);
+
+    // 表示面
+    canvas.width  = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // 残像バッファ（CSSピクセル基準でOK）
+    trailCanvas.width = w;
+    trailCanvas.height = h;
+    trailCtx.setTransform(1, 0, 0, 1, 0, 0);
+    // 初期クリア
+    trailCtx.fillStyle = '#05060a';
+    trailCtx.fillRect(0, 0, w, h);
+  }
+  fitToScreen();
+  addEventListener('resize', fitToScreen);
+  addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+
+  addEventListener('click', () => paused = !paused);
+  addEventListener('keydown', (e) => {
+    if (e.code === 'Space') { e.preventDefault(); paused = !paused; }
+    if (e.key.toLowerCase() === 'm') { mouseAttract = !mouseAttract; }
+  });
+
+  // 乱数
+  const rnd = (a,b)=>Math.random()*(b-a)+a;
+  const rndInt = (a,b)=>Math.floor(rnd(a,b+1));
+  const hsl = (h,s,l,a=1)=>`hsla(${(h%360+360)%360} ${s}% ${l}% / ${a})`;
+
+  /** ===== 背景グラデーション（動く） ===== */
+  function drawAnimatedBackground(t) {
+    const w = innerWidth, h = innerHeight;
+    const cx = w/2 + (mouse.x - w/2) * PARALLAX;
+    const cy = h/2 + (mouse.y - h/2) * PARALLAX;
+
+    const baseHue = (t * BG_HUE_SPEED) % 360;
+    const g = ctx.createRadialGradient(cx, cy, Math.min(w,h)*0.05, w/2, h/2, Math.max(w,h)*0.9);
+    g.addColorStop(0.00, hsl(baseHue +  0,  70, 12));
+    g.addColorStop(0.50, hsl(baseHue + 60,  70, 8));
+    g.addColorStop(1.00, hsl(baseHue + 120, 70, 5));
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,w,h);
+  }
+
+  /** ===== スクエアのプリレンダー ===== */
+  // 2色グラデーション用の広がり（色相差）。例: 60〜120 で好み調整
+  const TWO_TONE_SPREAD = 90;
+
+  function makeSquareTexture(size, hueBase) {
+    const off = document.createElement('canvas');
+    off.width = size;
+    off.height = size;
+    const g = off.getContext('2d');
+
+    // 角の発光は弱めに（縁の線が目立たないように）
+    g.shadowBlur = size * 0.10;
+    g.shadowColor = hsl(hueBase, 80, 58, 0.55);
+
+    // ――― ここがポイント：色相2色だけのシンプルな線形グラデーション ―――
+    const hue2 = hueBase + TWO_TONE_SPREAD;
+    const grad = g.createLinearGradient(0, 0, size, size); // 斜めでもOK
+    grad.addColorStop(0.00, hsl(hueBase, 80, 60));  // 1色目
+    grad.addColorStop(1.00, hsl(hue2,    80, 58));  // 2色目
+    g.fillStyle = grad;
+    g.fillRect(0, 0, size, size);
+
+    // 余計な対角線ハイライトやストロークは入れない（目立ちを抑制）
+    // g.globalCompositeOperation = 'overlay' などは使わない
+
+    return off;
+  }
+
+  /** ===== スクエア ===== */
+  class Square {
+    constructor(w,h,initial=false) { this.reset(w,h,initial); }
+    reset(w,h,initial=false) {
+      this.size = rndInt(SIZE_MIN, SIZE_MAX);
+      this.depth = rnd(0.0, 1.0); // 0:手前 1:奥
+      this.baseHue = rnd(0,360);
+      this.hueShift = rnd(0,360);
+      this.tex = makeSquareTexture(this.size, this.baseHue);
+
+      this.x0 = rnd(0,w);
+      this.y = initial ? rnd(0,h) : -this.size - rnd(0,h*0.2);
+      this.x = this.x0;
+      this.vy = rnd(FALL_MIN, FALL_MAX) * (0.6 + 0.8*(1-this.depth));
+      this.rot = rnd(0, Math.PI*2);
+      this.vrot = rnd(ROT_MIN, ROT_MAX) * (0.6 + 0.8*(1-this.depth));
+      this.swayAmp = rnd(SWAY_AMP_MIN, SWAY_AMP_MAX) * (0.5 + 0.7*(1-this.depth));
+      this.swayFreq = rnd(SWAY_FREQ_MIN, SWAY_FREQ_MAX);
+      this.swayPhase = rnd(0, Math.PI*2);
+
+      this.life = rnd(LIFE_MIN, LIFE_MAX);
+      this.age = initial ? rnd(0, this.life) : 0;
+      this.alpha = 0;
+    }
+    update(dt, w, h, t, mouse) {
+      this.age += dt;
+      if (this.age > this.life) this.reset(w,h,false);
+
+      // フェード（前半1.0秒でIN、後半1.0秒でOUT）
+      const fade = 1.0;
+      const aIn = Math.min(1, this.age / fade);
+      const aOut = Math.max(0, 1 - Math.max(0, this.age - (this.life - fade)) / fade);
+      this.alpha = Math.min(aIn, aOut);
+
+      // マウス引力
+      let ax = 0;
+      if (mouseAttract) {
+        const dx = mouse.x - this.x;
+        const dy = mouse.y - this.y;
+        const dist = Math.hypot(dx, dy) + 1;
+        const dirx = dx / dist;
+        ax = dirx * (MOUSE_GRAVITY / (1 + this.depth*8)); // 奥ほど弱め
+        this.x0 += ax * dt * 60;
+      }
+
+      this.y += this.vy * dt;
+      this.rot += this.vrot * dt;
+      this.x = this.x0 + Math.sin(this.swayPhase + t * this.swayFreq) * this.swayAmp;
+
+      // 画面外に落ちたらリセット
+      if (this.y > h + this.size) this.reset(w,h,false);
+
+      // ゆっくり色相が流れる
+      this.hueShift = (this.hueShift + HUE_DRIFT * dt) % 360;
+    }
+    draw(ctx) {
+      ctx.save();
+      const blurPx = this.depth * DOF_BLUR_MAX;
+      if (blurPx > 0.01) ctx.filter = `blur(${blurPx}px)`;
+
+      ctx.translate(this.x, this.y);
+      ctx.rotate(this.rot);
+
+      // ① 本体は通常合成で描く（加算しない）
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = this.alpha * (0.75 + 0.25*(1-this.depth));
+      ctx.drawImage(this.tex, -this.size/2, -this.size/2);
+
+      // ② 軽いティント（overlay）
+      ctx.globalCompositeOperation = 'overlay';
+      ctx.fillStyle = hsl(this.baseHue + this.hueShift, 90, 60, 0.25);
+      ctx.fillRect(-this.size/2, -this.size/2, this.size, this.size);
+
+      // ③ 縁の光だけ “lighter”
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.lineWidth = Math.max(1, this.size * 0.06);
+      ctx.strokeStyle = hsl(this.baseHue + this.hueShift + 40, 100, 70, 0.14);
+      ctx.strokeRect(-this.size/2, -this.size/2, this.size, this.size);
+
+      ctx.restore();
+      ctx.filter = 'none';
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  /** ===== 背景のボケ粒（星屑） ===== */
+  class Bokeh {
+    constructor(w,h) { this.reset(w,h,true); }
+    reset(w,h,initial=false) {
+      this.x = rnd(0,w);
+      this.y = initial ? rnd(0,h) : -rnd(10, h*0.1);
+      this.r = rnd(6, 40);
+      this.vy = rnd(10, 60);
+      this.hue = rnd(0,360);
+      this.a = rnd(0.05, 0.18);
+      this.tw = rnd(1.5, 5.0); // 瞬き周期
+      this.phase = rnd(0,Math.PI*2);
+    }
+    update(dt,w,h,t) {
+      this.y += this.vy * dt;
+      if (this.y - this.r > h) this.reset(w,h,false);
+      if (STAR_TWINKLE) {
+        // ゆっくり瞬き
+        const twinkle = (Math.sin(t * this.tw + this.phase) + 1)/2; // 0..1
+        this.alpha = this.a * (0.6 + 0.4 * twinkle);
+      } else {
+        this.alpha = this.a;
+      }
+    }
+    draw(ctx) {
+      ctx.save();
+      ctx.filter = `blur(${this.r*0.6}px)`;
+      ctx.globalCompositeOperation = 'lighter';
+      const grad = ctx.createRadialGradient(this.x, this.y, this.r*0.2, this.x, this.y, this.r);
+      grad.addColorStop(0, hsl(this.hue, 70, 70, this.alpha));
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(this.x, this.y, this.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+      ctx.filter = 'none';
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+
+  /** ===== 初期化 ===== */
+  let squares = [], bokeh = [];
+  function init() {
+    squares.length = 0; bokeh.length = 0;
+    const w = innerWidth, h = innerHeight;
+    for (let i=0; i<NUM_SQUARES; i++) squares.push(new Square(w,h,true));
+    for (let i=0; i<NUM_BOKEH; i++) bokeh.push(new Bokeh(w,h));
+  }
+  init();
+
+  /** ===== ループ ===== */
+  let last = performance.now();
+  let t = 0;
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last)/1000);
+    last = now;
+    if (!paused) t += dt;
+
+    const w = innerWidth, h = innerHeight;
+
+    // 1) 残像バッファをフェード（TRAILの効き具合）
+    if (TRAIL > 0) {
+      trailCtx.globalCompositeOperation = 'source-over';
+      trailCtx.fillStyle = `rgba(5,6,10, ${TRAIL})`;
+      trailCtx.fillRect(0, 0, w, h);
+    } else {
+      trailCtx.clearRect(0, 0, w, h);
+    }
+
+    // 2) 更新
+    if (!paused) for (const s of bokeh)  s.update(dt, w, h, t);
+    if (!paused) for (const s of squares) s.update(dt, w, h, t, mouse);
+
+    // 3) 残像バッファへ描画（← ここがポイント）
+    for (const s of bokeh)  s.draw(trailCtx);
+    squares.slice().sort((a,b)=>a.size-b.size).forEach(s=>s.draw(trailCtx));
+
+    // 4) 画面側：先に背景（後ろから敷く）
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    // 背景を後ろに置く
+    ctx.globalCompositeOperation = 'source-over';
+    drawAnimatedBackground(t);
+    ctx.restore();
+
+    // 5) 露出(EXPOSURE)をかけて残像レイヤを合成
+    ctx.save();
+    ctx.globalAlpha = EXPOSURE;       // ← これで白飛びを抑える
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(trailCanvas, 0, 0);
+    ctx.restore();
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // リサイズでふるまい更新
+  let rTimer=0;
+  addEventListener('resize', () => {
+    clearTimeout(rTimer);
+    rTimer = setTimeout(() => { fitToScreen(); init(); }, 150);
+  });
+
+})();
+</script>
+</body>
+</html>
