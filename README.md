@@ -9,7 +9,7 @@
 
 ## Demo
 
-[Live Demo](https://akikareha.github.io/falling-squares/)
+[Live Demo](https://page.kareha.org/falling-squares/)
 
 ---
 
