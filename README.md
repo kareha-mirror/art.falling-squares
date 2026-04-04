@@ -9,7 +9,7 @@
 
 ## Demo
 
-[Live Demo](https://page.kareha.org/falling-squares/)
+[Live Demo](https://demo.kareha.org/falling-squares/)
 
 ---
 
